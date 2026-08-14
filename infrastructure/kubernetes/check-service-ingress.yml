@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# Dedicated Ingress for check-service.
+#
+# Split out of the shared pos-ingress because Argo Rollouts' nginx traffic
+# routing takes ownership of the referenced Ingress: it clones it into a
+# "<rollout>-check-service-canary" Ingress carrying
+#
+#   nginx.ingress.kubernetes.io/canary: "true"
+#   nginx.ingress.kubernetes.io/canary-weight: "<current step weight>"
+#
+# and rewrites that weight at every step. Pointing it at the shared ingress
+# would have the controller cloning the routes for all seven services and
+# splitting their traffic too.
+#
+# The backend is check-service-stable, NOT check-service. Argo Rollouts
+# requires the stable Service here so it can leave this ingress alone and
+# express the canary share entirely through the generated companion.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: check-service-ingress
+  namespace: pos-system
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+spec:
+  rules:
+    - host: pos.local
+      http:
+        paths:
+          - path: /api/checks(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: check-service-stable
+                port:
+                  number: 8083

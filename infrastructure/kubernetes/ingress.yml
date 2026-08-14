@@ -46,14 +46,11 @@ spec:
                 port:
                   number: 8082
 
-          # Check Service
-          - path: /api/checks(/|$)(.*)
-            pathType: Prefix
-            backend:
-              service:
-                name: check-service
-                port:
-                  number: 8083
+          # Check Service routes have moved to check-service-ingress.yml.
+          # Argo Rollouts takes ownership of the Ingress named in the Rollout's
+          # trafficRouting block and clones it to express canary weight; if it
+          # owned this shared Ingress it would split traffic for all seven
+          # services, not just check-service.
 
           # Payment Gateway Service
           - path: /api/payments(/|$)(.*)

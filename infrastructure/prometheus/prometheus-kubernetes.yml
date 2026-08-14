@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# Prometheus scrape config for Kubernetes.
+#
+# The Compose-oriented prometheus.yml in this directory uses static_configs with
+# hardcoded hostnames. That cannot work in Kubernetes for two reasons:
+#
+#   1. Pod IPs change on every rollout, so a static target list goes stale.
+#   2. Static targets carry no pod or namespace label - and the canary analysis
+#      in analysis-templates.yml selects canary pods with
+#      pod=~"check-service-<hash>-.*". Without that label the query cannot tell
+#      canary from stable, averages both together, and a failing 5% canary
+#      barely moves the number. The gate would pass a broken release.
+#
+# The scrape annotations already present on the pod templates
+# (prometheus.io/scrape, /port, /path) are inert without the relabel_configs
+# below - they are only conventions that this config gives meaning to.
+# ---------------------------------------------------------------------------
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+
+    relabel_configs:
+      # Scrape only pods that opted in.
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+
+      # prometheus.io/path -> metrics path
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+
+      # prometheus.io/port -> replace the port in the target address
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+      # The two labels the canary analysis depends on.
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+
+      # Useful for grouping across a rollout.
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: replace
+        target_label: app
+      - source_labels: [__meta_kubernetes_node_name]
+        action: replace
+        target_label: node
+
+      # Argo Rollouts stamps this on every pod it manages. Keeping it means a
+      # query can select the canary ReplicaSet directly on the label rather
+      # than pattern-matching pod names.
+      - source_labels: [__meta_kubernetes_pod_label_rollouts_pod_template_hash]
+        action: replace
+        target_label: rollouts_pod_template_hash
+
+  # kube-state-metrics powers the canary-pods-available check. Omit this job
+  # and remove that metric from the AnalysisTemplate together - a query with no
+  # matching series fails the analysis and would abort every rollout.
+  - job_name: 'kube-state-metrics'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: ['kube-system', 'monitoring']
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        action: keep
+        regex: kube-state-metrics

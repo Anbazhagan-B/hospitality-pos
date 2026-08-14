@@ -1,0 +1,316 @@
+# ---------------------------------------------------------------------------
+# check-service - progressive delivery with Argo Rollouts
+#
+# Replaces the previous Deployment. A Deployment can only do rolling updates:
+# it has no concept of holding at a traffic percentage, running an analysis and
+# deciding whether to continue. The Rollout CRD adds exactly that, and is
+# otherwise a drop-in - the pod template below is unchanged.
+#
+# Requires the Argo Rollouts controller in the cluster:
+#   kubectl create namespace argo-rollouts
+#   kubectl apply -n argo-rollouts -f \
+#     https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+#
+# IMPORTANT: do not apply this alongside the old Deployment. Both select
+# app=check-service, so the two controllers would fight over the same pods.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: check-service
+  namespace: pos-system
+  labels:
+    app: check-service
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: check-service
+
+  strategy:
+    canary:
+      # Two Services with the same selector plus the rollout's generated
+      # pod-template-hash. Argo Rollouts keeps these pointed at the right pods
+      # so nginx can address stable and canary independently.
+      stableService: check-service-stable
+      canaryService: check-service-canary
+
+      trafficRouting:
+        nginx:
+          # Argo Rollouts clones this Ingress into "<name>-check-service-canary"
+          # with nginx canary annotations and rewrites the weight at each step.
+          # This is what makes setWeight: 5 mean 5% of requests rather than
+          # "one pod in twenty" - replica-count canaries cannot express 5% at
+          # two replicas.
+          stableIngress: check-service-ingress
+
+      # Aborting rolls all traffic straight back to stable and scales the
+      # canary ReplicaSet to zero.
+      abortScaleDownDelaySeconds: 30
+
+      steps:
+        - setWeight: 5
+        - pause: { duration: 5m }
+        - analysis:
+            templates:
+              - templateName: error-rate-and-p99
+            args:
+              # Passes the canary ReplicaSet's pod-template-hash into the
+              # template so its Prometheus queries measure ONLY canary pods.
+              # Without this the query averages canary and stable together and
+              # a 5% canary failing outright barely moves the number.
+              - name: canary-pod-hash
+                valueFrom:
+                  podTemplateHashValue: Latest
+              - name: service-name
+                value: check-service
+        - setWeight: 25
+        - pause: { duration: 10m }
+        - setWeight: 50
+        - pause: { duration: 10m }
+        # After the final step the rollout promotes to 100% automatically.
+
+  template:
+    metadata:
+      labels:
+        app: check-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8083"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      serviceAccountName: pos-service-account
+      # Longer than the slowest in-flight request. Paired with the preStop hook
+      # below, this is what stops a weight change from dropping a payment.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: check-service
+          image: pos-registry/check-service:latest
+          imagePullPolicy: Always
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal propagates to kube-proxy and the ingress
+                # controller asynchronously, in parallel with SIGTERM. Sleeping
+                # first lets deregistration win that race.
+                command: ["sh", "-c", "sleep 10"]
+          ports:
+            - name: http
+              containerPort: 8083
+              protocol: TCP
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              valueFrom:
+                configMapKeyRef:
+                  name: pos-config
+                  key: SPRING_PROFILES_ACTIVE
+            - name: SPRING_DATASOURCE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: pos-config
+                  key: SPRING_DATASOURCE_URL
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                configMapKeyRef:
+                  name: pos-config
+                  key: SPRING_DATASOURCE_USERNAME
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pos-secrets
+                  key: SPRING_DATASOURCE_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pos-secrets
+                  key: JWT_SECRET
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: pos-config
+                  key: KAFKA_BOOTSTRAP_SERVERS
+            - name: POS_ENVIRONMENT
+              value: "kubernetes"
+            - name: JAVA_OPTS
+              value: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8083
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8083
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8083
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+            - name: tmp
+              mountPath: /app/tmp
+      volumes:
+        - name: logs
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - check-service
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: check-service
+
+---
+# Stable Service - receives the majority of traffic and is the backend the
+# Ingress below points at.
+apiVersion: v1
+kind: Service
+metadata:
+  name: check-service-stable
+  namespace: pos-system
+  labels:
+    app: check-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8083
+      targetPort: 8083
+      protocol: TCP
+  selector:
+    app: check-service
+
+---
+# Canary Service - Argo Rollouts injects the canary pod-template-hash into this
+# selector during a rollout so it resolves only to new pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: check-service-canary
+  namespace: pos-system
+  labels:
+    app: check-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8083
+      targetPort: 8083
+      protocol: TCP
+  selector:
+    app: check-service
+
+---
+# Retains the original Service name so the six other services can keep calling
+# http://check-service:8083 without knowing a rollout is in progress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: check-service
+  namespace: pos-system
+  labels:
+    app: check-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8083
+      targetPort: 8083
+      protocol: TCP
+  selector:
+    app: check-service
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: check-service-hpa
+  namespace: pos-system
+spec:
+  scaleTargetRef:
+    # Must target the Rollout, not a Deployment. Argo Rollouts implements the
+    # scale subresource, so the HPA drives it the same way - but pointed at a
+    # Deployment that no longer exists, the HPA silently does nothing.
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: check-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # The memory target from the previous Deployment was removed deliberately.
+    # A JVM claims heap and does not return it to the OS, so memory utilisation
+    # ratchets upward and the HPA scales up but never back down.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: check-service-pdb
+  namespace: pos-system
+spec:
+  # Expressed as maxUnavailable rather than minAvailable so it scales with the
+  # HPA. minAvailable: 1 against 10 replicas would permit draining nine.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: check-service

@@ -1,0 +1,164 @@
+# ---------------------------------------------------------------------------
+# AnalysisTemplates referenced by Rollout canary steps.
+#
+# This is the piece that turns a canary from "wait and hope someone is watching
+# Grafana" into an automated gate. Each metric is queried against Prometheus on
+# an interval; if a successCondition fails more than failureLimit times the
+# AnalysisRun fails, and the Rollout aborts and shifts 100% of traffic back to
+# stable without human intervention.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate-and-p99
+  namespace: pos-system
+spec:
+  args:
+    # Supplied by the Rollout step via podTemplateHashValue: Latest.
+    - name: canary-pod-hash
+    - name: service-name
+      value: check-service
+    - name: prometheus-address
+      # Adjust to wherever Prometheus actually runs. If it lives in its own
+      # namespace this must be the fully-qualified name.
+      value: http://prometheus.pos-system.svc.cluster.local:9090
+
+  metrics:
+    # -----------------------------------------------------------------------
+    # 1. HTTP 5xx rate on canary pods only
+    # -----------------------------------------------------------------------
+    - name: error-rate
+      # Five measurements a minute apart. count x interval must fit inside the
+      # step's budget, otherwise the analysis is still running when the rollout
+      # wants to advance.
+      interval: 1m
+      count: 5
+      # 2% of requests failing. Tighten once you have a baseline - the right
+      # number is "meaningfully worse than stable", not an absolute ideal.
+      successCondition: result[0] <= 0.02
+      # One bad sample could be a single slow pod starting. Two consecutive
+      # failures is a trend.
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            (
+              sum(rate(http_server_requests_seconds_count{
+                namespace="pos-system",
+                pod=~"{{args.service-name}}-{{args.canary-pod-hash}}-.*",
+                outcome="SERVER_ERROR",
+                uri!~"/actuator.*"
+              }[2m])) or vector(0)
+            )
+            /
+            (
+              sum(rate(http_server_requests_seconds_count{
+                namespace="pos-system",
+                pod=~"{{args.service-name}}-{{args.canary-pod-hash}}-.*",
+                uri!~"/actuator.*"
+              }[2m])) or vector(1)
+            )
+            # "or vector(1)" on the denominator handles the no-traffic case.
+            # Without it an idle window makes the expression return empty,
+            # which Argo Rollouts scores as inconclusive rather than passing -
+            # and an inconclusive result blocks the rollout indefinitely.
+
+    # -----------------------------------------------------------------------
+    # 2. p99 latency on canary pods only
+    # -----------------------------------------------------------------------
+    - name: p99-latency
+      interval: 1m
+      count: 5
+      # Seconds. Micrometer publishes http_server_requests in seconds, not ms -
+      # comparing against 1500 here would never fail no matter how slow it got.
+      successCondition: result[0] <= 1.5
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(http_server_requests_seconds_bucket{
+                namespace="pos-system",
+                pod=~"{{args.service-name}}-{{args.canary-pod-hash}}-.*",
+                uri!~"/actuator.*"
+              }[2m])) by (le)
+            )
+            # Requires percentiles-histogram to be enabled in application.yml.
+            # Micrometer does not publish _bucket series by default and this
+            # query returns nothing without it.
+
+    # -----------------------------------------------------------------------
+    # 3. Canary pods are actually up
+    # -----------------------------------------------------------------------
+    # Error rate and latency both look healthy on a pod that is crash-looping,
+    # because a pod serving no traffic reports no errors. This catches the
+    # canary that never became ready in the first place.
+    - name: canary-pods-available
+      interval: 1m
+      count: 5
+      successCondition: result[0] >= 1
+      failureLimit: 0
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            sum(kube_pod_status_ready{
+              namespace="pos-system",
+              condition="true",
+              pod=~"{{args.service-name}}-{{args.canary-pod-hash}}-.*"
+            }) or vector(0)
+            # Requires kube-state-metrics. Drop this metric if it is not
+            # installed - a query against a non-existent series would fail the
+            # analysis and abort every rollout.
+
+---
+# ---------------------------------------------------------------------------
+# Payment-specific gate.
+#
+# Technical health is not sufficient for a money path. A release can hold error
+# rate and latency steady while quietly declining more cards - for example by
+# mis-mapping a tender type. This watches the business outcome instead.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: payment-authorisation-rate
+  namespace: pos-system
+spec:
+  args:
+    - name: canary-pod-hash
+    - name: prometheus-address
+      value: http://prometheus.pos-system.svc.cluster.local:9090
+  metrics:
+    - name: authorisation-rate
+      interval: 2m
+      count: 5
+      # Approvals should stay above 90%. A canary that starts declining
+      # everything is invisible to an HTTP-level check: a declined card is a
+      # perfectly successful HTTP 200.
+      successCondition: result[0] >= 0.90
+      failureLimit: 0
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            (
+              sum(rate(pos_payment_transactions_total{
+                namespace="pos-system",
+                pod=~"payment-gateway-service-{{args.canary-pod-hash}}-.*",
+                status="APPROVED"
+              }[5m])) or vector(0)
+            )
+            /
+            (
+              sum(rate(pos_payment_transactions_total{
+                namespace="pos-system",
+                pod=~"payment-gateway-service-{{args.canary-pod-hash}}-.*"
+              }[5m])) or vector(1)
+            )
+            # pos_payment_transactions_total does not exist yet. It needs a
+            # Micrometer Counter incremented in PaymentService, tagged with the
+            # transaction status. Until then this template will not gate
+            # anything - see infrastructure/kubernetes/ROLLOUTS.md.

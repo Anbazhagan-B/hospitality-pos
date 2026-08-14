@@ -18,7 +18,11 @@ pipeline {
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '10'))
-        timeout(time: 30, unit: 'MINUTES')
+        // The canary holds at 5% for 5m, runs a 5m analysis, then 25% and 50%
+        // for 10m each - roughly 35 minutes before promotion. The previous
+        // 30-minute budget would have killed a perfectly healthy rollout
+        // partway through and left traffic split.
+        timeout(time: 90, unit: 'MINUTES')
         timestamps()
         disableConcurrentBuilds()
     }
@@ -220,12 +224,15 @@ pipeline {
             steps {
                 echo "Deploying to development environment..."
                 withKubeConfig([credentialsId: 'kubernetes-config']) {
+                    // The workload is an Argo Rollout, not a Deployment, so
+                    // "deployment/${SERVICE_NAME}" no longer resolves.
                     sh """
-                        kubectl set image deployment/${SERVICE_NAME} \
+                        kubectl set image rollout/${SERVICE_NAME} \
                             ${SERVICE_NAME}=${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
-                            -n pos-system-dev \
-                            --record
-                        kubectl rollout status deployment/${SERVICE_NAME} -n pos-system-dev --timeout=300s
+                            -n pos-system-dev
+
+                        kubectl argo rollouts status ${SERVICE_NAME} \
+                            -n pos-system-dev --timeout 600s
                     """
                 }
             }
@@ -238,12 +245,25 @@ pipeline {
             steps {
                 echo "Deploying to staging environment..."
                 withKubeConfig([credentialsId: 'kubernetes-config']) {
+                    // The canary in check-service-rollout.yml pauses for 5m,
+                    // runs an analysis, then holds at 25% and 50% for 10m each.
+                    // A full promotion therefore takes ~35 minutes, which is
+                    // well past the pipeline's 30-minute option and Jenkins
+                    // would kill the build mid-rollout. Wait for the analysis
+                    // gate to clear, then let the rollout finish on its own.
                     sh """
-                        kubectl set image deployment/${SERVICE_NAME} \
+                        kubectl set image rollout/${SERVICE_NAME} \
                             ${SERVICE_NAME}=${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
-                            -n pos-system-staging \
-                            --record
-                        kubectl rollout status deployment/${SERVICE_NAME} -n pos-system-staging --timeout=300s
+                            -n pos-system-staging
+
+                        # Blocks until the canary clears analysis or aborts.
+                        # A failed analysis exits non-zero and fails the build.
+                        kubectl argo rollouts status ${SERVICE_NAME} \
+                            -n pos-system-staging --timeout 2400s || {
+                                echo "Canary analysis failed - rolling back"
+                                kubectl argo rollouts abort ${SERVICE_NAME} -n pos-system-staging
+                                exit 1
+                            }
                     """
                 }
             }
@@ -284,11 +304,16 @@ pipeline {
                 input message: 'Deploy to production?', ok: 'Deploy'
                 withKubeConfig([credentialsId: 'kubernetes-config']) {
                     sh """
-                        kubectl set image deployment/${SERVICE_NAME} \
+                        kubectl set image rollout/${SERVICE_NAME} \
                             ${SERVICE_NAME}=${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
-                            -n pos-system \
-                            --record
-                        kubectl rollout status deployment/${SERVICE_NAME} -n pos-system --timeout=300s
+                            -n pos-system
+
+                        kubectl argo rollouts status ${SERVICE_NAME} \
+                            -n pos-system --timeout 2400s || {
+                                echo "Production canary failed - aborting"
+                                kubectl argo rollouts abort ${SERVICE_NAME} -n pos-system
+                                exit 1
+                            }
                     """
                 }
             }

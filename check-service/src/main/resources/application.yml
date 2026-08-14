@@ -48,6 +48,31 @@ management:
   endpoint:
     health:
       show-details: always
+      # Explicit rather than relying on Spring Boot's Kubernetes auto-detection.
+      # The rollout's liveness and readiness probes hit /actuator/health/liveness
+      # and /readiness; without this those groups do not exist, return 404, and
+      # the kubelet reads 404 as a failed probe -> CrashLoopBackOff.
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      # Lets a Prometheus query select one service's series without relying on
+      # the job label, which differs between Compose and Kubernetes.
+      application: ${spring.application.name}
+    distribution:
+      # REQUIRED by the canary analysis. Micrometer only publishes
+      # http_server_requests_seconds_bucket when histogram output is enabled;
+      # without it histogram_quantile() has no series to read and the p99
+      # metric returns empty, which Argo Rollouts scores as inconclusive and
+      # the rollout stalls rather than promoting or aborting.
+      percentiles-histogram:
+        http.server.requests: true
+      # Bounding the range keeps bucket cardinality sane. A request slower than
+      # 2s is already a failure for a POS terminal.
+      minimum-expected-value:
+        http.server.requests: 10ms
+      maximum-expected-value:
+        http.server.requests: 2s
 
 springdoc:
   api-docs:
