@@ -31,6 +31,16 @@ spring:
         # kitchen-display consumer can continue the same trace. Without it the
         # trace stops dead at the broker.
         interceptor.classes: com.pos.common.logging.MdcProducerInterceptor
+        # send() blocks resolving topic metadata before it returns its future,
+        # for up to max.block.ms - 60 seconds by default. addItem publishes an
+        # OrderEvent on the request thread, so an unreachable broker made every
+        # "add item to check" hang for a minute and then time out, even though
+        # the check had already been saved successfully. 3s is long enough to
+        # tolerate a leader election and short enough that a server at a
+        # terminal is not left waiting.
+        max.block.ms: 3000
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
 
 kafka:
   topics:
@@ -96,6 +106,18 @@ pos:
   environment: ${POS_ENVIRONMENT:local}
   logging:
     slow-call-threshold-ms: ${POS_SLOW_CALL_MS:1000}
+
+  check:
+    # jpa (default) or dynamodb. Selecting the backend by configuration rather
+    # than by code means a migration can be rolled back without a redeploy.
+    store: ${POS_CHECK_STORE:jpa}
+
+  dynamodb:
+    table-name: ${POS_DYNAMODB_TABLE:pos-checks}
+    region: ${AWS_REGION:ap-south-1}
+    # Point at DynamoDB Local for development. Empty in AWS, where the SDK
+    # resolves the real regional endpoint and credentials come from IRSA.
+    endpoint: ${POS_DYNAMODB_ENDPOINT:}
 
 logging:
   level:

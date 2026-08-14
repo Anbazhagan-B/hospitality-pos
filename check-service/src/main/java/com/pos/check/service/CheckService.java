@@ -5,7 +5,7 @@ import com.pos.check.entity.Check;
 import com.pos.check.entity.CheckItem;
 import com.pos.check.entity.CheckItemModifier;
 import com.pos.check.event.OrderEvent;
-import com.pos.check.repository.CheckRepository;
+import com.pos.check.repository.CheckStore;
 import com.pos.common.dto.PageResponse;
 import com.pos.common.exception.BadRequestException;
 import com.pos.common.exception.ResourceNotFoundException;
@@ -28,17 +28,16 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class CheckService {
 
-    private final CheckRepository checkRepository;
+    private final CheckStore checkStore;
     private final OrderEventPublisher orderEventPublisher;
 
     @Transactional
     public CheckDto createCheck(CreateCheckRequest request) {
         log.info("Creating new check for employee: {}", request.getEmployeeId());
 
-        String checkNumber = generateCheckNumber();
-
+        // The check number is assigned by the store, together with the id, from
+        // a single sequence value - see CheckStore.save.
         Check check = Check.builder()
-                .checkNumber(checkNumber)
                 .status(Check.CheckStatus.OPEN)
                 .subtotal(BigDecimal.ZERO)
                 .taxAmount(BigDecimal.ZERO)
@@ -54,31 +53,31 @@ public class CheckService {
                 .openedAt(LocalDateTime.now())
                 .build();
 
-        check = checkRepository.save(check);
-        log.info("Check created with number: {}", checkNumber);
+        check = checkStore.save(check);
+        log.info("Check created with number: {}", check.getCheckNumber());
 
         return toDto(check);
     }
 
     public CheckDto getCheckById(Long id) {
-        Check check = checkRepository.findById(id)
+        Check check = checkStore.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Check", "id", id));
         return toDto(check);
     }
 
     public CheckDto getCheckByNumber(String checkNumber) {
-        Check check = checkRepository.findByCheckNumber(checkNumber)
+        Check check = checkStore.findByCheckNumber(checkNumber)
                 .orElseThrow(() -> new ResourceNotFoundException("Check", "checkNumber", checkNumber));
         return toDto(check);
     }
 
     public PageResponse<CheckDto> getChecksByOrganization(Long organizationId, Pageable pageable) {
-        Page<Check> page = checkRepository.findByOrganizationId(organizationId, pageable);
+        Page<Check> page = checkStore.findByOrganizationId(organizationId, pageable);
         return toPageResponse(page);
     }
 
     public List<CheckDto> getOpenChecks(Long organizationId) {
-        return checkRepository.findByOrganizationAndStatus(organizationId, Check.CheckStatus.OPEN)
+        return checkStore.findByOrganizationAndStatus(organizationId, Check.CheckStatus.OPEN)
                 .stream()
                 .map(this::toDto)
                 .collect(Collectors.toList());
@@ -89,7 +88,7 @@ public class CheckService {
     public CheckDto addItem(Long checkId, AddItemRequest request) {
         log.info("Adding item to check: {}", checkId);
 
-        Check check = checkRepository.findById(checkId)
+        Check check = checkStore.findById(checkId)
                 .orElseThrow(() -> new ResourceNotFoundException("Check", "id", checkId));
 
         if (check.getStatus() == Check.CheckStatus.CLOSED ||
@@ -123,7 +122,7 @@ public class CheckService {
         check.addItem(item);
         check.setStatus(Check.CheckStatus.IN_PROGRESS);
 
-        check = checkRepository.save(check);
+        check = checkStore.save(check);
 
         publishOrderEvent(check, OrderEvent.EventType.ITEM_ADDED);
 
@@ -140,14 +139,14 @@ public class CheckService {
     public CheckDto sendToKitchen(Long checkId) {
         log.info("Sending check {} to kitchen", checkId);
 
-        Check check = checkRepository.findById(checkId)
+        Check check = checkStore.findById(checkId)
                 .orElseThrow(() -> new ResourceNotFoundException("Check", "id", checkId));
 
         check.getItems().stream()
                 .filter(item -> item.getStatus() == CheckItem.ItemStatus.ORDERED)
                 .forEach(item -> item.setStatus(CheckItem.ItemStatus.SENT_TO_KITCHEN));
 
-        check = checkRepository.save(check);
+        check = checkStore.save(check);
 
         publishOrderEvent(check, OrderEvent.EventType.ORDER_PLACED);
 
@@ -158,7 +157,7 @@ public class CheckService {
     public CheckDto voidItem(Long checkId, Long itemId, String reason) {
         log.info("Voiding item {} on check {}", itemId, checkId);
 
-        Check check = checkRepository.findById(checkId)
+        Check check = checkStore.findById(checkId)
                 .orElseThrow(() -> new ResourceNotFoundException("Check", "id", checkId));
 
         CheckItem item = check.getItems().stream()
@@ -171,7 +170,7 @@ public class CheckService {
         item.setStatus(CheckItem.ItemStatus.VOIDED);
 
         check.recalculateTotals();
-        check = checkRepository.save(check);
+        check = checkStore.save(check);
 
         publishOrderEvent(check, OrderEvent.EventType.ITEM_REMOVED);
 
@@ -182,7 +181,7 @@ public class CheckService {
     public CheckDto closeCheck(Long checkId) {
         log.info("Closing check {}", checkId);
 
-        Check check = checkRepository.findById(checkId)
+        Check check = checkStore.findById(checkId)
                 .orElseThrow(() -> new ResourceNotFoundException("Check", "id", checkId));
 
         if (check.getPaidAmount().compareTo(check.getTotalAmount()) < 0) {
@@ -192,7 +191,7 @@ public class CheckService {
         check.setStatus(Check.CheckStatus.CLOSED);
         check.setClosedAt(LocalDateTime.now());
 
-        check = checkRepository.save(check);
+        check = checkStore.save(check);
         return toDto(check);
     }
 
@@ -230,9 +229,6 @@ public class CheckService {
         orderEventPublisher.publishOrderEvent(event);
     }
 
-    private String generateCheckNumber() {
-        return "CHK-" + System.currentTimeMillis();
-    }
 
     private CheckDto toDto(Check check) {
         return CheckDto.builder()

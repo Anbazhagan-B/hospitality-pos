@@ -37,6 +37,7 @@
         <mapstruct.version>1.5.5.Final</mapstruct.version>
         <lombok.version>1.18.30</lombok.version>
         <logstash-encoder.version>7.4</logstash-encoder.version>
+        <aws-sdk.version>2.25.60</aws-sdk.version>
     </properties>
 
     <dependencyManagement>
@@ -94,6 +95,15 @@
                 <groupId>net.logstash.logback</groupId>
                 <artifactId>logstash-logback-encoder</artifactId>
                 <version>${logstash-encoder.version}</version>
+            </dependency>
+
+            <!-- AWS SDK v2 BOM - keeps every AWS artifact on one version -->
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws-sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>

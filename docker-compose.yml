@@ -49,6 +49,26 @@ services:
       retries: 5
     logging: *default-logging
 
+  # DynamoDB Local - check-service store when POS_CHECK_STORE=dynamodb
+  #
+  # -inMemory keeps everything in RAM, so the table vanishes on restart. That is
+  # deliberate for development: a schema mistake is fixed by restarting rather
+  # than by migrating. Swap to -dbPath with a volume if data should survive.
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.2
+    ports:
+      - "8000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    working_dir: /home/dynamodblocal
+    healthcheck:
+      # DynamoDB Local answers unauthenticated requests with 400, which is proof
+      # enough that it is listening.
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:8000 | grep -q 400"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
   # Apache Kafka
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
