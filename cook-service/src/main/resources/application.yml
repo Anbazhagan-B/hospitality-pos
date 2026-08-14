@@ -19,6 +19,34 @@ spring:
     username: sa
     password:
 
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      timeout: 500ms
+      connect-timeout: 500ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+          max-wait: 200ms
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: cook-service-cache-invalidation
+      auto-offset-reset: latest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        # The producer strips type headers, so the consumer is told which type
+        # to bind to. Without this the payload deserializes to a LinkedHashMap
+        # and the listener silently does nothing.
+        spring.json.value.default.type: com.pos.common.cache.CacheInvalidationEvent
+        spring.json.trusted.packages: com.pos.common.cache
+        spring.json.use.type.headers: false
+
 # Cook batch configuration
 cook:
   batch:
@@ -41,6 +69,16 @@ management:
   endpoint:
     health:
       show-details: always
+      probes:
+        enabled: true
+      group:
+        # Redis is deliberately excluded - see the note in
+        # enterprise-management-service/application.yml. The cache failing open
+        # must not remove this pod from the load balancer.
+        readiness:
+          include: readinessState, db
+        liveness:
+          include: livenessState
 
 springdoc:
   api-docs:
@@ -64,6 +102,11 @@ pos:
   environment: ${POS_ENVIRONMENT:local}
   logging:
     slow-call-threshold-ms: ${POS_SLOW_CALL_MS:1000}
+  cache:
+    enabled: ${POS_CACHE_ENABLED:false}
+    invalidation:
+      enabled: ${POS_CACHE_ENABLED:false}
+      topic: cache-invalidation
 
 logging:
   level:

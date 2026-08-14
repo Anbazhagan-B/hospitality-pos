@@ -1,10 +1,12 @@
 package com.pos.cook.service;
 
+import com.pos.common.cache.CacheNames;
 import com.pos.cook.dto.TerminalConfig;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -23,12 +25,33 @@ public class TerminalConfigService {
     @Value("${services.enterprise-service.url:http://localhost:8082}")
     private String enterpriseServiceUrl;
 
+    /**
+     * Assembled terminal configuration - menu, tenders and settings in one
+     * document, pulled by every terminal on startup and on every menu refresh.
+     *
+     * <p>The organisation id leads the key because the document is entirely
+     * tenant-scoped. Keying on {@code terminalId} alone would be a cross-tenant
+     * leak the moment two restaurants both name a terminal "T-01", which is
+     * exactly the kind of collision a POS deployment produces by default.
+     *
+     * <p>Invalidated by {@code CacheInvalidationListener} when
+     * enterprise-management reports a menu, tender or terminal change; the
+     * 10-minute TTL only bounds a missed event.
+     *
+     * <p>Note the ordering with the circuit breaker: {@code @Cacheable} is
+     * applied first, so a cache hit never enters the breaker and a hit still
+     * serves normally while the breaker is open.
+     */
+    @Cacheable(cacheNames = CacheNames.TERMINAL_CONFIG, key = "#organizationId + ':' + #terminalId")
     @CircuitBreaker(name = "cookService", fallbackMethod = "getTerminalConfigFallback")
     public TerminalConfig generateTerminalConfig(String terminalId, Long organizationId) {
         log.info("Generating terminal configuration for terminal: {} org: {}", terminalId, organizationId);
 
-        // In production, fetch data from Enterprise Management Service
-        // For now, generate sample configuration
+        // In production, fetch data from Enterprise Management Service.
+        // NOTE: webClientBuilder is injected but unused - this still returns a
+        // hardcoded sample, so today the cache saves assembly cost rather than a
+        // network round-trip. The caching is in the right place for when the
+        // real call is wired in.
         return buildSampleConfig(terminalId, organizationId);
     }
 

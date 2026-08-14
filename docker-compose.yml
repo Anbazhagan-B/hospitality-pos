@@ -28,6 +28,27 @@ services:
       timeout: 5s
       retries: 5
 
+  # Redis - service-layer cache for read-mostly reference data
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    # maxmemory-policy matters: allkeys-lru evicts the least recently used key
+    # when full, which is correct for a pure cache. The default (noeviction)
+    # would start returning OOM errors on write once memory filled - turning a
+    # full cache into failing requests instead of cache misses.
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
   # Apache Kafka
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -182,9 +203,16 @@ services:
       - SPRING_DATASOURCE_USERNAME=pos_user
       - SPRING_DATASOURCE_PASSWORD=pos_password
       - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+      - POS_CACHE_ENABLED=true
+      - SPRING_DATA_REDIS_HOST=redis
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
 
   # Check Service
   check-service:
@@ -277,8 +305,16 @@ services:
       - SPRING_PROFILES_ACTIVE=docker
       - ENTERPRISE_SERVICE_URL=http://enterprise-management-service:8082
       - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+      - POS_CACHE_ENABLED=true
+      - SPRING_DATA_REDIS_HOST=redis
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
     depends_on:
-      - enterprise-management-service
+      enterprise-management-service:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
 
 volumes:
   postgres_data:

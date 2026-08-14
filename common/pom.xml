@@ -70,11 +70,30 @@
         <!--
             Optional: only the services that already declare spring-kafka get the
             MDC propagation beans. Guarded at runtime by @ConditionalOnClass so the
-            non-Kafka services (employee, enterprise, admin, cook) are unaffected.
+            non-Kafka services are unaffected.
         -->
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!--
+            Optional for the same reason, and here it matters more: pulling
+            spring-boot-starter-data-redis into every service would register a
+            Redis health indicator in all of them, and a service with no Redis
+            to talk to would report its health endpoint DOWN - which the
+            readiness probe reads as "remove this pod from the load balancer".
+            Only enterprise-management and cook declare these.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
             <optional>true</optional>
         </dependency>
     </dependencies>

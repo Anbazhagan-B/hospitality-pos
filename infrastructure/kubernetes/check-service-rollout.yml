@@ -162,7 +162,11 @@ spec:
             failureThreshold: 3
           startupProbe:
             httpGet:
-              path: /actuator/health
+              # The liveness group, not the aggregate /actuator/health. The
+              # aggregate reports DOWN when any optional dependency is
+              # unreachable, so a cache or broker outage would stop the pod
+              # from ever starting.
+              path: /actuator/health/liveness
               port: 8083
             periodSeconds: 10
             timeoutSeconds: 5
