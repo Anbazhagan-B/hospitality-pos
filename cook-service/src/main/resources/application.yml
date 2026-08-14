@@ -1,0 +1,70 @@
+server:
+  port: 8087
+
+spring:
+  application:
+    name: cook-service
+
+  # Spring Batch configuration
+  batch:
+    jdbc:
+      initialize-schema: always
+    job:
+      enabled: false
+
+  # H2 Database for Spring Batch metadata
+  datasource:
+    url: jdbc:h2:mem:batchdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+# Cook batch configuration
+cook:
+  batch:
+    chunk-size: 10
+    output-path: ./output/cook-orders
+
+jwt:
+  secret: ${JWT_SECRET:MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong}
+  expiration: 86400000
+
+services:
+  enterprise-service:
+    url: ${ENTERPRISE_SERVICE_URL:http://localhost:8082}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      cookService:
+        registerHealthIndicator: true
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 5
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        waitDurationInOpenState: 5s
+        failureRateThreshold: 50
+
+pos:
+  environment: ${POS_ENVIRONMENT:local}
+  logging:
+    slow-call-threshold-ms: ${POS_SLOW_CALL_MS:1000}
+
+logging:
+  level:
+    com.pos: ${POS_LOG_LEVEL:INFO}

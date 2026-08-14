@@ -1,0 +1,70 @@
+server:
+  port: 8084
+
+spring:
+  application:
+    name: payment-gateway-service
+  datasource:
+    url: jdbc:h2:mem:paymentdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+jwt:
+  secret: ${JWT_SECRET:MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong}
+  expiration: 86400000
+
+services:
+  check-service:
+    url: ${CHECK_SERVICE_URL:http://localhost:8083}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        registerHealthIndicator: true
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 5
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        waitDurationInOpenState: 5s
+        failureRateThreshold: 50
+
+pos:
+  environment: ${POS_ENVIRONMENT:local}
+  logging:
+    slow-call-threshold-ms: ${POS_SLOW_CALL_MS:1000}
+
+logging:
+  level:
+    # Never raise this to DEBUG in a deployed environment. This service handles
+    # cardholder data, and at DEBUG the logging aspect serialises PaymentRequest
+    # into the log event. SensitiveDataMasker redacts the PAN, but the safest
+    # position is not to emit the payload at all.
+    com.pos: ${POS_LOG_LEVEL:INFO}

@@ -1,0 +1,181 @@
+# ---------------------------------------------------------------------------
+# Filebeat as a DaemonSet - one collector pod per node.
+#
+# A DaemonSet is the right shape here because container logs are a *node*
+# resource: every pod on the node writes to /var/log/pods, so one collector per
+# node reads all of them. The alternative - a logging sidecar in every pod -
+# multiplies memory cost by the number of pods and has to be added to every
+# deployment manifest.
+#
+# Elasticsearch and Kibana are deliberately NOT defined here. Running a
+# stateful, memory-hungry search cluster by hand-rolled StatefulSet is a
+# standing operational commitment. Use a managed offering (Elastic Cloud,
+# AWS OpenSearch, Azure/GCP equivalents) or the ECK operator, and point
+# ELASTICSEARCH_HOSTS at it.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: filebeat
+  namespace: pos-system
+
+---
+# Filebeat enriches each log line with the pod, namespace, node and labels it
+# came from. That requires reading pod metadata from the API server, so it needs
+# a ClusterRole - read-only, and scoped to exactly the three resources it uses.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: filebeat
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods", "nodes"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "watch", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: filebeat
+subjects:
+  - kind: ServiceAccount
+    name: filebeat
+    namespace: pos-system
+roleRef:
+  kind: ClusterRole
+  name: filebeat
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: pos-system
+data:
+  filebeat.yml: |
+    filebeat.inputs:
+      - type: container
+        paths:
+          - /var/log/containers/*.log
+        processors:
+          # Resolves the symlinked container log path back to the pod that owns
+          # it, adding kubernetes.pod.name, .namespace, .labels and .node.name.
+          - add_kubernetes_metadata:
+              host: ${NODE_NAME}
+              matchers:
+                - logs_path:
+                    logs_path: "/var/log/containers/"
+
+    processors:
+      # Only ship logs from the POS namespace. Without this, Filebeat collects
+      # kube-system, the CNI, the ingress controller and every other DaemonSet
+      # on the node, which dominates the index and the bill.
+      - drop_event:
+          when:
+            not:
+              equals:
+                kubernetes.namespace: "pos-system"
+
+      # Never ship Filebeat's own output back into the pipeline.
+      - drop_event:
+          when:
+            contains:
+              kubernetes.labels.app: "filebeat"
+
+    output.logstash:
+      hosts: ["logstash.pos-system.svc.cluster.local:5044"]
+
+    logging.level: info
+    logging.to_files: false
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: filebeat
+  namespace: pos-system
+  labels:
+    app: filebeat
+spec:
+  selector:
+    matchLabels:
+      app: filebeat
+  template:
+    metadata:
+      labels:
+        app: filebeat
+    spec:
+      serviceAccountName: filebeat
+      terminationGracePeriodSeconds: 30
+      # Log collection must run on every node, including control-plane and
+      # tainted pools - a node whose logs are not collected is a blind spot
+      # exactly when you need it.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: filebeat
+          image: docker.elastic.co/beats/filebeat:8.12.2
+          args: ["-c", "/etc/filebeat.yml", "-e"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            # Container log files under /var/log/pods are root-owned.
+            runAsUser: 0
+            privileged: false
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # No CPU limit: throttling the log shipper during an incident is
+              # precisely when you least want it to fall behind. Memory is
+              # limited because it is incompressible.
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/filebeat.yml
+              readOnly: true
+              subPath: filebeat.yml
+            - name: data
+              mountPath: /usr/share/filebeat/data
+            - name: varlogcontainers
+              mountPath: /var/log/containers
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            defaultMode: 0640
+            name: filebeat-config
+        - name: varlogcontainers
+          hostPath:
+            path: /var/log/containers
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        # Registry file tracking read offsets. On a hostPath so a Filebeat
+        # restart resumes where it stopped instead of re-shipping every log on
+        # the node, which would duplicate documents in Elasticsearch.
+        - name: data
+          hostPath:
+            path: /var/lib/filebeat-data
+            type: DirectoryOrCreate

@@ -1,0 +1,53 @@
+# ---- Build output ----
+target/
+build/
+out/
+*.jar
+*.war
+*.class
+!.mvn/wrapper/maven-wrapper.jar
+
+# ---- IDE ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+nbproject/
+
+# ---- Logs and local runtime artifacts ----
+*.log
+logs/
+output/
+nul
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Secrets and local overrides ----
+# Never commit real credentials. The values currently in docker-compose.yml and
+# infrastructure/kubernetes/configmap.yml are development placeholders only;
+# real environments supply them via External Secrets or a cloud secret store.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+application-local.yml
+application-local.properties
+secrets.yml
+
+# ---- Elasticsearch / Logstash local data ----
+elasticsearch_data/
+logstash_data/
+filebeat_data/
+
+# ---- Local machine-specific tool config ----
+.claude/settings.local.json

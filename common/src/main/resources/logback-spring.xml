@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Shared logging configuration for every POS service.
+
+    This file ships inside the common jar, and Spring Boot picks it up from the
+    classpath, so no service needs its own copy. A service that genuinely needs
+    to differ can add its own logback-spring.xml, which takes precedence.
+
+    Two output shapes, selected by profile:
+
+      local / default / test  -> human-readable console. Nobody wants to read
+                                 JSON while debugging on their laptop.
+      docker / kubernetes     -> single-line JSON on stdout, collected by
+                                 Filebeat and parsed by Logstash.
+
+    Deliberately no file appender. Containers log to stdout; writing to disk
+    inside a pod means the logs die with the pod, compete for the container
+    filesystem, and need rotation nobody configured.
+-->
+<configuration>
+
+    <springProperty scope="context" name="serviceName"
+                    source="spring.application.name" defaultValue="pos-service"/>
+    <springProperty scope="context" name="environment"
+                    source="pos.environment" defaultValue="local"/>
+
+    <!-- ============================================================
+         Human-readable console, for local development
+         ============================================================ -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %highlight(%-5level) [%thread] %cyan(%X{correlationId:-no-correlation-id}) %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- ============================================================
+         Structured JSON, for the ELK pipeline
+
+         Every MDC key must be listed explicitly. The default of including all
+         MDC keys is convenient and dangerous: any library that writes to MDC
+         then contributes an unmapped field, and enough unmapped fields will hit
+         the Elasticsearch index field limit and start rejecting documents.
+         ============================================================ -->
+    <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <timeZone>UTC</timeZone>
+
+            <!--
+                Logback context properties (the springProperty values above) are
+                included by default and would emit serviceName/environment
+                alongside the customFields below - duplicate JSON keys, plus an
+                unmapped serviceName field that the strict index template
+                rejects outright. customFields is the single source here.
+            -->
+            <includeContext>false</includeContext>
+
+            <fieldNames>
+                <timestamp>@timestamp</timestamp>
+                <message>message</message>
+                <logger>logger</logger>
+                <thread>thread</thread>
+                <levelValue>[ignore]</levelValue>
+                <version>[ignore]</version>
+                <stackTrace>stack_trace</stackTrace>
+            </fieldNames>
+
+            <customFields>{"service":"${serviceName}","environment":"${environment}"}</customFields>
+
+            <includeMdcKeyName>correlationId</includeMdcKeyName>
+            <includeMdcKeyName>userId</includeMdcKeyName>
+            <includeMdcKeyName>username</includeMdcKeyName>
+            <includeMdcKeyName>organizationId</includeMdcKeyName>
+            <includeMdcKeyName>terminalId</includeMdcKeyName>
+            <includeMdcKeyName>httpMethod</includeMdcKeyName>
+            <includeMdcKeyName>path</includeMdcKeyName>
+            <includeMdcKeyName>httpStatus</includeMdcKeyName>
+            <includeMdcKeyName>durationMs</includeMdcKeyName>
+            <includeMdcKeyName>kafkaTopic</includeMdcKeyName>
+
+            <!--
+                Full stack traces are the single most useful thing in a
+                production error, but an unbounded trace can produce a document
+                larger than Elasticsearch will accept. Root cause first, because
+                that is the line you actually read.
+            -->
+            <throwableConverter class="net.logstash.logback.stacktrace.ShortenedThrowableConverter">
+                <maxDepthPerThrowable>40</maxDepthPerThrowable>
+                <maxLength>8192</maxLength>
+                <rootCauseFirst>true</rootCauseFirst>
+                <exclude>^sun\.reflect\..*\.invoke</exclude>
+                <exclude>^net\.sf\.cglib\.proxy\.MethodProxy\.invoke</exclude>
+            </throwableConverter>
+        </encoder>
+    </appender>
+
+    <!--
+        Logging must never become the reason a payment is slow. neverBlock drops
+        events instead of blocking the request thread when the queue is full,
+        which is the correct trade for a POS: losing a log line is survivable,
+        stalling a card authorisation is not.
+    -->
+    <appender name="ASYNC_JSON" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="JSON"/>
+        <queueSize>2048</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <neverBlock>true</neverBlock>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!-- ============================================================
+         Profile bindings
+         ============================================================ -->
+    <springProfile name="docker,kubernetes,staging,prod">
+        <root level="INFO">
+            <appender-ref ref="ASYNC_JSON"/>
+        </root>
+        <logger name="com.pos" level="INFO"/>
+        <!-- Hibernate SQL echoing is enabled in the yml files; at INFO it would
+             put a log line in Elasticsearch for every statement. -->
+        <logger name="org.hibernate.SQL" level="WARN"/>
+        <logger name="org.apache.kafka" level="WARN"/>
+        <logger name="org.springframework.web.socket" level="WARN"/>
+    </springProfile>
+
+    <springProfile name="local,default,test">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+        <logger name="com.pos" level="DEBUG"/>
+    </springProfile>
+
+</configuration>

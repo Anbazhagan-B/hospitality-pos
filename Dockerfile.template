@@ -1,0 +1,42 @@
+# Generic Dockerfile for POS microservices
+# Build stage
+FROM eclipse-temurin:17-jdk-alpine as build
+WORKDIR /workspace/app
+
+# Copy maven wrapper and pom files
+COPY mvnw .
+COPY .mvn .mvn
+COPY pom.xml .
+COPY common/pom.xml common/
+
+# Download dependencies
+RUN ./mvnw dependency:go-offline -B
+
+# Copy source code
+COPY common/src common/src
+COPY ${SERVICE_NAME}/pom.xml ${SERVICE_NAME}/
+COPY ${SERVICE_NAME}/src ${SERVICE_NAME}/src
+
+# Build the application
+RUN ./mvnw package -pl common,${SERVICE_NAME} -DskipTests
+
+# Runtime stage
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+
+# Add non-root user for security
+RUN addgroup -S spring && adduser -S spring -G spring
+USER spring:spring
+
+# Copy the built jar
+COPY --from=build /workspace/app/${SERVICE_NAME}/target/*.jar app.jar
+
+# Expose port (override in docker-compose)
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD wget -q --spider http://localhost:8080/actuator/health || exit 1
+
+# Run the application
+ENTRYPOINT ["java", "-Djava.security.egd=file:/dev/./urandom", "-jar", "app.jar"]

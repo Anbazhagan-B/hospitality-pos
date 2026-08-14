@@ -1,0 +1,288 @@
+version: '3.8'
+
+# Docker's json-file driver is unbounded by default. Now that every service
+# emits structured JSON for Filebeat to collect, an idle laptop can fill its
+# disk overnight. Filebeat reads these same files, so rotation must leave enough
+# history for it to catch up after a restart - 3 x 50MB is comfortable.
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: pos_user
+      POSTGRES_PASSWORD: pos_password
+      POSTGRES_DB: pos_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pos_user -d pos_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Apache Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:10.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  # ==========================================================================
+  # ELK stack - log aggregation
+  #
+  # Flow: service stdout (JSON) -> Filebeat -> Logstash -> Elasticsearch -> Kibana
+  #
+  # The services do not know ELK exists. They write JSON to stdout and Filebeat
+  # collects it from the Docker log files, so the pipeline can be restarted or
+  # removed without touching the application.
+  # ==========================================================================
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+    environment:
+      - discovery.type=single-node
+      # DEV ONLY. Disabling security removes TLS and authentication entirely.
+      # In any shared or production environment leave security on and supply
+      # credentials via a secret - see infrastructure/elk/README.md.
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      # Elasticsearch will refuse to start if the heap exceeds available memory.
+      # 1g is the practical minimum for a stack this size.
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - cluster.name=pos-logs
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.12.2
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - LS_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "5044:5044"   # beats input
+      - "9600:9600"   # monitoring API
+    volumes:
+      - ./infrastructure/elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./infrastructure/elk/logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - logstash_data:/usr/share/logstash/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.2
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_NAME=pos-kibana
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.12.2
+    # Filebeat must read root-owned Docker log files and the Docker socket.
+    user: root
+    command: ["filebeat", "-e", "-strict.perms=false"]
+    volumes:
+      - ./infrastructure/elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - filebeat_data:/usr/share/filebeat/data
+    depends_on:
+      - logstash
+
+  # Employee Service
+  employee-service:
+    build:
+      context: ./employee-service
+      dockerfile: Dockerfile
+    logging: *default-logging
+    ports:
+      - "8081:8081"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/pos_db
+      - SPRING_DATASOURCE_USERNAME=pos_user
+      - SPRING_DATASOURCE_PASSWORD=pos_password
+      - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Enterprise Management Service
+  enterprise-management-service:
+    build:
+      context: ./enterprise-management-service
+      dockerfile: Dockerfile
+    logging: *default-logging
+    ports:
+      - "8082:8082"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/pos_db
+      - SPRING_DATASOURCE_USERNAME=pos_user
+      - SPRING_DATASOURCE_PASSWORD=pos_password
+      - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Check Service
+  check-service:
+    build:
+      context: ./check-service
+      dockerfile: Dockerfile
+    logging: *default-logging
+    ports:
+      - "8083:8083"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/pos_db
+      - SPRING_DATASOURCE_USERNAME=pos_user
+      - SPRING_DATASOURCE_PASSWORD=pos_password
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # Payment Gateway Service
+  payment-gateway-service:
+    build:
+      context: ./payment-gateway-service
+      dockerfile: Dockerfile
+    logging: *default-logging
+    ports:
+      - "8084:8084"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/pos_db
+      - SPRING_DATASOURCE_USERNAME=pos_user
+      - SPRING_DATASOURCE_PASSWORD=pos_password
+      - CHECK_SERVICE_URL=http://check-service:8083
+      - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Kitchen Display Service
+  kitchen-display-service:
+    build:
+      context: ./kitchen-display-service
+      dockerfile: Dockerfile
+    logging: *default-logging
+    ports:
+      - "8085:8085"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/pos_db
+      - SPRING_DATASOURCE_USERNAME=pos_user
+      - SPRING_DATASOURCE_PASSWORD=pos_password
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # Admin Panel Service
+  admin-panel-service:
+    build:
+      context: ./admin-panel-service
+      dockerfile: Dockerfile
+    logging: *default-logging
+    ports:
+      - "8086:8086"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/pos_db
+      - SPRING_DATASOURCE_USERNAME=pos_user
+      - SPRING_DATASOURCE_PASSWORD=pos_password
+      - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Cook Service
+  cook-service:
+    build:
+      context: ./cook-service
+      dockerfile: Dockerfile
+    logging: *default-logging
+    ports:
+      - "8087:8087"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - ENTERPRISE_SERVICE_URL=http://enterprise-management-service:8082
+      - JWT_SECRET=MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong
+    depends_on:
+      - enterprise-management-service
+
+volumes:
+  postgres_data:
+  grafana_data:
+  elasticsearch_data:
+  logstash_data:
+  filebeat_data:

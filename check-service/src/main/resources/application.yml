@@ -1,0 +1,81 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: check-service
+  datasource:
+    url: jdbc:h2:mem:checkdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+        # Attaches the current correlation id as a Kafka record header so the
+        # kitchen-display consumer can continue the same trace. Without it the
+        # trace stops dead at the broker.
+        interceptor.classes: com.pos.common.logging.MdcProducerInterceptor
+
+kafka:
+  topics:
+    order-events: order-events
+
+jwt:
+  secret: ${JWT_SECRET:MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong}
+  expiration: 86400000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      checkService:
+        registerHealthIndicator: true
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 5
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        waitDurationInOpenState: 5s
+        failureRateThreshold: 50
+
+pos:
+  environment: ${POS_ENVIRONMENT:local}
+  logging:
+    slow-call-threshold-ms: ${POS_SLOW_CALL_MS:1000}
+
+logging:
+  level:
+    # INFO by default in every deployed environment. At DEBUG the logging aspect
+    # emits request and response bodies for every call, which multiplies
+    # Elasticsearch storage and puts raw user input into the index.
+    # Override per-pod with POS_LOG_LEVEL when actively debugging.
+    com.pos: ${POS_LOG_LEVEL:INFO}

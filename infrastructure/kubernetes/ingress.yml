@@ -1,0 +1,99 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pos-ingress
+  namespace: pos-system
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+spec:
+  rules:
+    - host: pos.local
+      http:
+        paths:
+          # Employee Service
+          - path: /api/auth(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: employee-service
+                port:
+                  number: 8081
+          - path: /api/employees(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: employee-service
+                port:
+                  number: 8081
+
+          # Enterprise Management Service
+          - path: /api/organizations(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: enterprise-management-service
+                port:
+                  number: 8082
+          - path: /api/menu-items(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: enterprise-management-service
+                port:
+                  number: 8082
+
+          # Check Service
+          - path: /api/checks(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: check-service
+                port:
+                  number: 8083
+
+          # Payment Gateway Service
+          - path: /api/payments(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: payment-gateway-service
+                port:
+                  number: 8084
+
+          # Kitchen Display Service
+          - path: /api/kitchen(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: kitchen-display-service
+                port:
+                  number: 8085
+          - path: /ws/kitchen(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: kitchen-display-service
+                port:
+                  number: 8085
+
+          # Admin Panel Service
+          - path: /api/forms(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-panel-service
+                port:
+                  number: 8086
+
+          # Cook Service
+          - path: /api/terminal-config(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: cook-service
+                port:
+                  number: 8087

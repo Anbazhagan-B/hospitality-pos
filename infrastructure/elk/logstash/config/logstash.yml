@@ -1,0 +1,15 @@
+http.host: "0.0.0.0"
+
+# The monitoring UI in Kibana reads these. Disabled by default because the
+# self-monitoring exporter writes its own indices and doubles the cluster's
+# write load on a laptop-sized deployment.
+xpack.monitoring.enabled: false
+
+# Persistent queue survives a Logstash restart without losing in-flight events.
+# Filebeat also retries, so this is belt-and-braces, but it protects events that
+# were acknowledged to Filebeat and not yet written to Elasticsearch.
+queue.type: persisted
+queue.max_bytes: 512mb
+
+pipeline.workers: 2
+pipeline.batch.size: 250

@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pos-config
+  namespace: pos-system
+data:
+  SPRING_PROFILES_ACTIVE: "kubernetes"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres:5432/pos_db"
+  SPRING_DATASOURCE_USERNAME: "pos_user"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pos-secrets
+  namespace: pos-system
+type: Opaque
+stringData:
+  SPRING_DATASOURCE_PASSWORD: "pos_password"
+  JWT_SECRET: "MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong"

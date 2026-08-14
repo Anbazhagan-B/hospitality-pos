@@ -1,0 +1,59 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: employee-service
+  datasource:
+    url: jdbc:h2:mem:employeedb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    # Without this, data.sql executes before Hibernate creates the schema and
+    # the service fails to start with "Table PERMISSIONS not found". Pre-existing
+    # defect, unrelated to logging - see the note in infrastructure/elk/README.md.
+    defer-datasource-initialization: true
+    properties:
+      hibernate:
+        format_sql: true
+
+jwt:
+  secret: ${JWT_SECRET:MySecretKeyForJWTTokenGenerationThatIsAtLeast256BitsLong}
+  expiration: 86400000
+  refresh-expiration: 604800000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+pos:
+  environment: ${POS_ENVIRONMENT:local}
+  logging:
+    slow-call-threshold-ms: ${POS_SLOW_CALL_MS:1000}
+
+logging:
+  level:
+    com.pos: ${POS_LOG_LEVEL:INFO}
+    # Spring Security at DEBUG logs the full filter chain for every request and
+    # can echo authentication details. Useful locally, far too noisy and too
+    # revealing to ship into a searchable log index.
+    org.springframework.security: ${POS_SECURITY_LOG_LEVEL:WARN}

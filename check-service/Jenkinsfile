@@ -1,0 +1,346 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven-3.9'
+        jdk 'JDK-17'
+    }
+
+    environment {
+        SERVICE_NAME = 'check-service'
+        SERVICE_PORT = '8083'
+        DOCKER_REGISTRY = credentials('docker-registry-url')
+        DOCKER_CREDENTIALS = credentials('docker-registry-credentials')
+        SONAR_TOKEN = credentials('sonarqube-token')
+        KUBE_CONFIG = credentials('kubernetes-config')
+        IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out source code..."
+                checkout scm
+                script {
+                    env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                    env.GIT_AUTHOR = sh(script: 'git log -1 --pretty=%an', returnStdout: true).trim()
+                }
+            }
+        }
+
+        stage('Build Common Module') {
+            steps {
+                echo "Building common module..."
+                sh './mvnw clean install -pl common -DskipTests -B'
+            }
+        }
+
+        stage('Compile') {
+            steps {
+                echo "Compiling ${SERVICE_NAME}..."
+                sh "./mvnw compile -pl ${SERVICE_NAME} -B"
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                echo "Running unit tests..."
+                sh "./mvnw test -pl ${SERVICE_NAME} -B"
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: "${SERVICE_NAME}/target/surefire-reports/*.xml"
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                echo "Running integration tests..."
+                sh "./mvnw verify -pl ${SERVICE_NAME} -DskipUnitTests -B"
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: "${SERVICE_NAME}/target/failsafe-reports/*.xml"
+                }
+            }
+        }
+
+        stage('Code Quality Analysis') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    when {
+                        anyOf {
+                            branch 'main'
+                            branch 'develop'
+                            changeRequest()
+                        }
+                    }
+                    steps {
+                        echo "Running SonarQube analysis..."
+                        withSonarQubeEnv('SonarQube') {
+                            sh """
+                                ./mvnw sonar:sonar \
+                                    -pl ${SERVICE_NAME} \
+                                    -Dsonar.projectKey=pos-${SERVICE_NAME} \
+                                    -Dsonar.projectName='POS ${SERVICE_NAME}' \
+                                    -Dsonar.token=${SONAR_TOKEN} \
+                                    -B
+                            """
+                        }
+                    }
+                }
+
+                stage('Dependency Check') {
+                    steps {
+                        echo "Checking dependencies for vulnerabilities..."
+                        sh "./mvnw dependency-check:check -pl ${SERVICE_NAME} -B || true"
+                    }
+                    post {
+                        always {
+                            dependencyCheckPublisher pattern: "${SERVICE_NAME}/target/dependency-check-report.xml", failedTotalCritical: 1
+                        }
+                    }
+                }
+
+                stage('Code Coverage') {
+                    steps {
+                        echo "Generating code coverage report..."
+                        sh "./mvnw jacoco:report -pl ${SERVICE_NAME} -B"
+                    }
+                    post {
+                        always {
+                            jacoco(
+                                execPattern: "${SERVICE_NAME}/target/jacoco.exec",
+                                classPattern: "${SERVICE_NAME}/target/classes",
+                                sourcePattern: "${SERVICE_NAME}/src/main/java",
+                                exclusionPattern: "${SERVICE_NAME}/src/test/**"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                echo "Checking quality gate..."
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                echo "Packaging ${SERVICE_NAME}..."
+                sh "./mvnw package -pl ${SERVICE_NAME} -DskipTests -B"
+                archiveArtifacts artifacts: "${SERVICE_NAME}/target/*.jar", fingerprint: true
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo "Building Docker image..."
+                dir("${SERVICE_NAME}") {
+                    sh """
+                        docker build \
+                            -t ${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
+                            -t ${DOCKER_REGISTRY}/${SERVICE_NAME}:latest \
+                            --build-arg JAR_FILE=target/*.jar \
+                            -f Dockerfile .
+                    """
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            parallel {
+                stage('Trivy Image Scan') {
+                    steps {
+                        echo "Scanning Docker image for vulnerabilities..."
+                        sh """
+                            trivy image \
+                                --severity HIGH,CRITICAL \
+                                --exit-code 0 \
+                                --format table \
+                                ${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}
+                        """
+                    }
+                }
+
+                stage('Container Structure Test') {
+                    steps {
+                        echo "Testing container structure..."
+                        sh """
+                            container-structure-test test \
+                                --image ${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
+                                --config ${SERVICE_NAME}/container-structure-test.yaml || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                    branch 'release/*'
+                }
+            }
+            steps {
+                echo "Pushing Docker image to registry..."
+                sh """
+                    echo ${DOCKER_CREDENTIALS_PSW} | docker login ${DOCKER_REGISTRY} -u ${DOCKER_CREDENTIALS_USR} --password-stdin
+                    docker push ${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}
+                    docker push ${DOCKER_REGISTRY}/${SERVICE_NAME}:latest
+                """
+            }
+        }
+
+        stage('Deploy to Development') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                echo "Deploying to development environment..."
+                withKubeConfig([credentialsId: 'kubernetes-config']) {
+                    sh """
+                        kubectl set image deployment/${SERVICE_NAME} \
+                            ${SERVICE_NAME}=${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
+                            -n pos-system-dev \
+                            --record
+                        kubectl rollout status deployment/${SERVICE_NAME} -n pos-system-dev --timeout=300s
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo "Deploying to staging environment..."
+                withKubeConfig([credentialsId: 'kubernetes-config']) {
+                    sh """
+                        kubectl set image deployment/${SERVICE_NAME} \
+                            ${SERVICE_NAME}=${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
+                            -n pos-system-staging \
+                            --record
+                        kubectl rollout status deployment/${SERVICE_NAME} -n pos-system-staging --timeout=300s
+                    """
+                }
+            }
+        }
+
+        stage('Smoke Tests') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                echo "Running smoke tests..."
+                script {
+                    def namespace = env.BRANCH_NAME == 'main' ? 'pos-system-staging' : 'pos-system-dev'
+                    sh """
+                        # Wait for service to be ready
+                        sleep 30
+
+                        # Health check
+                        kubectl exec -n ${namespace} \
+                            \$(kubectl get pod -n ${namespace} -l app=${SERVICE_NAME} -o jsonpath='{.items[0].metadata.name}') \
+                            -- wget -q --spider http://localhost:${SERVICE_PORT}/actuator/health || exit 1
+
+                        echo "Smoke tests passed!"
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'release/*'
+            }
+            steps {
+                echo "Deploying to production environment..."
+                input message: 'Deploy to production?', ok: 'Deploy'
+                withKubeConfig([credentialsId: 'kubernetes-config']) {
+                    sh """
+                        kubectl set image deployment/${SERVICE_NAME} \
+                            ${SERVICE_NAME}=${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} \
+                            -n pos-system \
+                            --record
+                        kubectl rollout status deployment/${SERVICE_NAME} -n pos-system --timeout=300s
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline completed successfully!"
+            slackSend(
+                channel: '#pos-deployments',
+                color: 'good',
+                message: """
+                    :white_check_mark: *${SERVICE_NAME} Build #${env.BUILD_NUMBER} Successful*
+                    *Branch:* ${env.BRANCH_NAME}
+                    *Commit:* ${env.GIT_COMMIT_MSG}
+                    *Author:* ${env.GIT_AUTHOR}
+                    *Image:* ${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}
+                    <${env.BUILD_URL}|View Build>
+                """.stripIndent()
+            )
+        }
+        failure {
+            echo "Pipeline failed!"
+            slackSend(
+                channel: '#pos-deployments',
+                color: 'danger',
+                message: """
+                    :x: *${SERVICE_NAME} Build #${env.BUILD_NUMBER} Failed*
+                    *Branch:* ${env.BRANCH_NAME}
+                    *Commit:* ${env.GIT_COMMIT_MSG}
+                    *Author:* ${env.GIT_AUTHOR}
+                    <${env.BUILD_URL}|View Build>
+                """.stripIndent()
+            )
+        }
+        unstable {
+            echo "Pipeline unstable - tests may have failed"
+            slackSend(
+                channel: '#pos-deployments',
+                color: 'warning',
+                message: """
+                    :warning: *${SERVICE_NAME} Build #${env.BUILD_NUMBER} Unstable*
+                    *Branch:* ${env.BRANCH_NAME}
+                    <${env.BUILD_URL}|View Build>
+                """.stripIndent()
+            )
+        }
+        always {
+            echo "Cleaning up..."
+            sh "docker rmi ${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG} || true"
+            cleanWs()
+        }
+    }
+}

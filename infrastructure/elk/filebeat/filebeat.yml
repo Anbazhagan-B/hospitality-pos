@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Filebeat - log shipper for the POS stack (Docker Compose)
+#
+# Reads the Docker json-file logs written by every container on the host and
+# forwards them to Logstash. The application never talks to the log pipeline
+# directly, so Elasticsearch being down cannot slow down or block a payment.
+# ---------------------------------------------------------------------------
+
+filebeat.inputs:
+  - type: container
+    enabled: true
+    paths:
+      - /var/lib/docker/containers/*/*.log
+    # Stack traces arrive as multiple lines on stdout only when the JSON encoder
+    # is bypassed (a JVM crash, or a startup failure before Logback initialises).
+    # Everything logged through Logback is already one JSON object per line.
+    multiline.type: pattern
+    multiline.pattern: '^[[:space:]]+(at|\.{3})[[:space:]]|^Caused by:'
+    multiline.negate: false
+    multiline.match: after
+
+processors:
+  # Attaches container name, image and labels so logs can be filtered by service
+  # even before Logstash parses the application payload.
+  - add_docker_metadata:
+      host: "unix:///var/run/docker.sock"
+
+  # Drop the noise from the observability stack itself. Without this, Filebeat
+  # ships Elasticsearch's own logs into Elasticsearch, which then produces more
+  # logs. It is a real feedback loop and it fills disks.
+  - drop_event:
+      when:
+        or:
+          - contains:
+              container.image.name: "elasticsearch"
+          - contains:
+              container.image.name: "logstash"
+          - contains:
+              container.image.name: "kibana"
+          - contains:
+              container.image.name: "filebeat"
+
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+
+output.logstash:
+  hosts: ["logstash:5044"]
+  # Filebeat retries indefinitely and tracks its read offset in the registry
+  # file, so a Logstash restart delays delivery rather than losing it.
+  bulk_max_size: 2048
+
+logging.level: info
+logging.to_files: false
+
+# Filebeat's own health, useful when logs mysteriously stop arriving.
+http.enabled: true
+http.host: 0.0.0.0
+http.port: 5066
